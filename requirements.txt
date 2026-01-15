@@ -1,0 +1,9 @@
+opencv-python
+mediapipe
+picamera2
+numpy
+smbus2
+Adafruit_DHT
+sounddevice
+librosa
+tflite-runtime
