@@ -1,11 +1,12 @@
 import time
 import queue
 from collections import deque
+from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import librosa
+import os
 
-# Try TensorFlow first (tf.lite), then fall back to tflite-runtime
 def _load_interpreter(model_path: str):
     try:
         import tensorflow as tf
@@ -23,7 +24,6 @@ def _load_interpreter(model_path: str):
     except Exception as e:
         raise RuntimeError(f"Cannot create TFLite interpreter: {e}")
 
-# Optional band-pass 300..4000 Hz
 def _bandpass(x: np.ndarray, sr: int, low=300, high=4000):
     try:
         from scipy.signal import butter, lfilter
@@ -33,27 +33,14 @@ def _bandpass(x: np.ndarray, sr: int, low=300, high=4000):
     except Exception:
         return x
 
-def _mel_image(
-    audio: np.ndarray,
-    sr: int = 16000,
-    target_hw=(128, 128),
-    n_fft=1024,
-    hop_length=256,
-    n_mels=128,
-    use_bandpass=True,
-):
-    # Optional denoise band
+def _mel_image(audio: np.ndarray, sr: int = 16000, target_hw=(128, 128),
+               n_fft=1024, hop_length=256, n_mels=128, use_bandpass=True):
     x = _bandpass(audio, sr) if use_bandpass else audio
-    # Mel power spectrogram
-    S = librosa.feature.melspectrogram(
-        y=x, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length, power=2.0
-    )
-    # Fixed dB scale, then clip to [-80, 0]
+    S = librosa.feature.melspectrogram(y=x, sr=sr, n_mels=n_mels, n_fft=n_fft,
+                                       hop_length=hop_length, power=2.0)
     logmel = librosa.power_to_db(S, ref=1.0)
     logmel = np.clip(logmel, -80.0, 0.0)
-    # Map to [0,1]
     img01 = (logmel + 80.0) / 80.0
-    # Resize to target_hw using Pillow (keep simple, LANCZOS)
     try:
         from PIL import Image
         img_u8 = (img01 * 255.0).astype(np.uint8)
@@ -61,25 +48,19 @@ def _mel_image(
         pil = pil.resize(target_hw, Image.Resampling.LANCZOS)
         arr = np.array(pil).astype(np.float32) / 255.0
     except Exception:
-        # Lightweight fallback: pad/crop then simple resample by slicing
-        # (not as good as PIL, but keeps shapes right)
         h, w = img01.shape
         th, tw = target_hw
-        # pad/crop width
         if w < tw:
             pad = tw - w
             img01 = np.pad(img01, ((0, 0), (0, pad)))
         arr = img01[:, :tw]
         if h != th:
-            # naive vertical resample
             ys = np.linspace(0, h - 1, th).astype(np.int32)
             arr = arr[ys, :]
-    # Stack to 3 channels (RGB-like)
     rgb = np.stack([arr] * 3, axis=-1).astype(np.float32)
     return rgb
 
 class _MicStream:
-    """Overlap audio windowing: segment_sec with hop_ratio."""
     def __init__(self, sr=16000, segment_sec=2.0, hop_ratio=0.5, device=None):
         self.sr = sr
         self.segment_len = int(segment_sec * sr)
@@ -94,18 +75,11 @@ class _MicStream:
         self.q.put(mono)
 
     def start(self):
-        self.stream = sd.InputStream(
-            samplerate=self.sr,
-            channels=1,
-            dtype="float32",
-            device=self.device,
-            callback=self._callback,
-            blocksize=0,
-        )
+        self.stream = sd.InputStream(samplerate=self.sr, channels=1, dtype="float32",
+                                     device=self.device, callback=self._callback, blocksize=0)
         self.stream.start()
 
     def next_segment(self):
-        # Pull whatever is in the queue
         pulled = False
         while True:
             try:
@@ -130,33 +104,20 @@ class _MicStream:
             pass
 
 class CryDetector:
-    """
-    Matches the behavior you described:
-    - Mel log dB in [-80, 0], resized to 128x128, 3 channels
-    - Optional band-pass 300..4000 Hz
-    - RMS gate to skip quiet frames
-    - Moving-average smoothing over N frames
-    - Min-duration requirement before raising 'isCrying'
-    - Works with float or int8 quantized TFLite models
-    - Aligns with classes.npy for 'cry' / 'not_cry'
-    """
+    def __init__(self, tflite_path=None, classes_path=None, sr=16000, segment_sec=2.0,
+                 hop_ratio=0.5, cry_threshold=0.6, min_duration=2.0, rms_gate=0.005,
+                 smooth_n=5, use_bandpass=True, print_probs=False, device=None):
+        here = Path(__file__).resolve()
+        assets = here.parents[1] / "assets"
+        if tflite_path is None:
+            tflite_path = str(assets / "model.tflite")
+        if classes_path is None:
+            classes_path = str(assets / "classes.npy")
+        if not Path(tflite_path).exists():
+            raise FileNotFoundError(f"TFLite model not found at: {Path(tflite_path).resolve()}")
+        if not Path(classes_path).exists():
+            raise FileNotFoundError(f"classes.npy not found at: {Path(classes_path).resolve()}")
 
-    def __init__(
-        self,
-        tflite_path="src/assets/modef.tflite",
-        classes_path="src/assets/classes.npy",
-        sr=16000,
-        segment_sec=2.0,
-        hop_ratio=0.5,
-        cry_threshold=0.6,
-        min_duration=2.0,
-        rms_gate=0.005,
-        smooth_n=5,
-        use_bandpass=True,
-        print_probs=False,
-        device=None,
-    ):
-        # Audio
         self.sr = sr
         self.segment_sec = segment_sec
         self.hop_ratio = hop_ratio
@@ -164,14 +125,12 @@ class CryDetector:
         self.rms_gate = float(rms_gate)
         self.use_bandpass = bool(use_bandpass)
 
-        # Smoothing / decision
         self.cry_threshold = float(cry_threshold)
         self.min_duration = float(min_duration)
         self.above_streak_s = 0.0
         self.hist = deque(maxlen=max(1, int(smooth_n)))
         self.print_probs = bool(print_probs)
 
-        # Model
         self.interp = _load_interpreter(tflite_path)
         self.inp = self.interp.get_input_details()[0]
         self.out = self.interp.get_output_details()[0]
@@ -180,7 +139,6 @@ class CryDetector:
         self.in_q = self.inp.get("quantization", (0.0, 0))
         self.out_q = self.out.get("quantization", (0.0, 0))
 
-        # Classes
         self.classes = [str(c) for c in np.load(classes_path, allow_pickle=True)]
         names_lower = [c.lower() for c in self.classes]
 
@@ -193,7 +151,6 @@ class CryDetector:
         self.cry_idx = _find("cry")
         self.not_idx = _find("not_cry", "no_cry", "non_cry", "notcry", "nocry")
 
-        # Mic
         self.mic = _MicStream(sr=sr, segment_sec=segment_sec, hop_ratio=hop_ratio, device=device)
         self.mic.start()
 
@@ -212,18 +169,15 @@ class CryDetector:
         if self.out_is_int8:
             s, z = self.out_q
             out = (out.astype(np.float32) - z) * (s if s != 0 else 1.0)
-        # softmax
         e = np.exp(out[0] - np.max(out[0]))
         probs = e / np.sum(e)
         return probs.astype(float)
 
     def read_state(self):
-        """Return a dict when a new window is processed, else None."""
         seg = self.mic.next_segment()
         if seg is None:
             return None
 
-        # RMS gate: very quiet -> treat as not crying
         rms = float(np.sqrt(np.mean(seg ** 2)))
         if rms < self.rms_gate:
             pcry, pnot = 0.0, 1.0
@@ -232,44 +186,27 @@ class CryDetector:
             isCrying = ps >= self.cry_threshold
             above = False
         else:
-            img = _mel_image(
-                seg,
-                sr=self.sr,
-                target_hw=(128, 128),
-                n_fft=1024,
-                hop_length=256,
-                n_mels=128,
-                use_bandpass=self.use_bandpass,
-            )
+            img = _mel_image(seg, sr=self.sr, target_hw=(128, 128),
+                             n_fft=1024, hop_length=256, n_mels=128,
+                             use_bandpass=self.use_bandpass)
             probs = self._infer_probs(img)
-
-            # map to pCry / pNot
             if self.cry_idx is not None and self.not_idx is not None:
-                pcry = float(probs[self.cry_idx])
-                pnot = float(probs[self.not_idx])
+                pcry = float(probs[self.cry_idx]); pnot = float(probs[self.not_idx])
             elif probs.size == 2:
                 if self.cry_idx is not None:
-                    pcry = float(probs[self.cry_idx])
-                    pnot = 1.0 - pcry
+                    pcry = float(probs[self.cry_idx]); pnot = 1.0 - pcry
                 else:
-                    # assume index 1 is 'cry'
                     pcry = float(probs[1]); pnot = float(probs[0])
             elif self.cry_idx is not None:
                 pcry = float(probs[self.cry_idx]); pnot = 1.0 - pcry
             else:
-                m = int(np.argmax(probs))
-                pcry = float(probs[m]); pnot = 1.0 - pcry
+                m = int(np.argmax(probs)); pcry = float(probs[m]); pnot = 1.0 - pcry
 
             self.hist.append(pcry)
             ps = float(np.mean(self.hist))
             isCrying = ps >= self.cry_threshold
             above = isCrying
 
-            if self.print_probs:
-                # optional verbose output (do not print here; main() can do it)
-                pass
-
-        # min-duration logic using hop seconds
         if above:
             self.above_streak_s += self.frame_hop_s
         else:
@@ -277,14 +214,7 @@ class CryDetector:
 
         event = (self.above_streak_s >= self.min_duration)
         if event:
-            # reset so next continuous exceedance triggers again
             self.above_streak_s = 0.0
 
-        return {
-            "isCrying": isCrying,
-            "pCry": round(pcry, 4),
-            "pNot": round(pnot, 4),
-            "smooth": round(ps, 4),
-            "rms": round(rms, 6),
-            "event": event,  # True right when min-duration satisfied
-        }
+        return {"isCrying": isCrying, "pCry": round(pcry, 4), "pNot": round(pnot, 4),
+                "smooth": round(ps, 4), "rms": round(rms, 6), "event": event}

@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Log files
+*.log
+boot.log
+cron.log
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.lgd-*
+
+# Sensitive credentials & keys
+*firebase-adminsdk*.json
+*service_account*.json
+creds/
+credentials.json

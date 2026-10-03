@@ -1,9 +1,14 @@
 opencv-python
 mediapipe
-picamera2
 numpy
 smbus2
-Adafruit_DHT
+adafruit-circuitpython-dht
+adafruit-blinka
 sounddevice
 librosa
 tflite-runtime
+Pillow
+scipy
+firebase-admin
+protobuf==4.25.8
+mediapipe==0.10.14
